@@ -1,0 +1,863 @@
+---
+title: "SAEH Model Building"
+subtitle: "Purpose: Run longitunidal model and model fit diagnostics"
+subject: "PI: Emily Boniface"
+author: "Kelsey MacKenzie"
+date: February 5, 2026
+format: html
+editor: visual
+---
+
+```{r, include = FALSE}
+##### Load packages 
+library(dplyr)
+library(glmmTMB)
+library(nlme)
+library(lme4)
+library(ggplot2)
+library(effects)
+library(geepack)
+library(doBy)
+library(emmeans)
+library(gt)
+library(tidyverse)
+library(haven)
+
+#### Import Data
+SAEH_model_data <- readRDS("SAEH_dataset.rds")
+```
+
+# Exploration
+
+```{r}
+# Looking at variables of interest
+table(SAEH_model_data$gestat, SAEH_model_data$marg_group, useNA = "always")
+
+# How many records exceed 43 weeks for gestational duration?
+SAEH_model_data %>%
+  filter(gestat > 43) %>%
+  count(gestat, sort = TRUE)
+
+### Specifically the 88s
+sum(SAEH_model_data$gestat == 88, na.rm = TRUE)
+
+### Recode only 88 to NA (coded as "Not applicable" in the dictionary)
+SAEH_model_data <- SAEH_model_data %>%
+  mutate(gestat = ifelse(gestat == 88, NA, gestat))
+
+### Verify that fix
+summary(SAEH_model_data$gestat)
+
+# Make sure gestation is numeric
+SAEH_model_data <- SAEH_model_data %>% mutate(gestat_clean = as.numeric(gestat))
+
+# Binary: Late (≥13 weeks, 2nd trimester+) vs Early (<13 weeks)
+SAEH_full <- SAEH_model_data %>%
+  mutate(gest_age_cat = case_when(
+    gestat_clean <= 12 ~ "Early",
+    gestat_clean >= 13 ~ "Late",
+    is.na(gestat_clean) ~ NA_character_)) %>%
+  mutate(gest_age_cat = factor(gest_age_cat, levels = c("Early", "Late")))
+
+### Distribution of the cleaned continuous variable
+summary(SAEH_full$gestat_clean)
+
+### Distribution of the categorized variable
+table(SAEH_full$gest_age_cat, useNA = "always")
+
+### Cross-tab with marginalization group to get a first look
+table(SAEH_full$gest_age_cat, SAEH_full$marg_group, useNA = "always")
+
+# What percentage have gestat data? Split early/late?
+prop.table(table(SAEH_full$gest_age_cat), margin = NULL) * 100  # %
+```
+
+## Plots
+
+```{r}
+# Plot 1: Mean gestational duration by year, split by marginalization group
+p1 <- SAEH_full %>%
+  filter(!is.na(gestat_clean) & !is.na(marg_group)) %>%
+  group_by(year, marg_group) %>%
+  summarise(mean_gest = mean(gestat_clean, na.rm = TRUE),
+            se = sd(gestat_clean, na.rm = TRUE) / sqrt(n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = year, y = mean_gest, color = marg_group, group = marg_group)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_errorbar(aes(ymin = mean_gest - 1.96*se,
+                    ymax = mean_gest + 1.96*se), width = 0.2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  scale_color_manual(values = c("Less marginalized" = "steelblue",
+                                "More marginalized" = "tomato")) +
+  labs(title = "Mean gestational duration at presentation by year and marginalization group",
+       x = "Year of discharge",
+       y = "Mean gestational duration (weeks)",
+       color = "Marginalization group") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5))
+
+p1
+
+# Plot 2: Proportion of Late presentations by year and marginalization group
+p2 <- SAEH_full %>%
+  filter(!is.na(gest_age_cat) & !is.na(marg_group)) %>%
+  group_by(year, marg_group) %>%
+  summarise(prop_late = mean(gest_age_cat == "Late", na.rm = TRUE),
+            .groups = "drop") %>%
+  ggplot(aes(x = year, y = prop_late, color = marg_group, group = marg_group)) +
+  geom_point(size = 3) +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  scale_color_manual(values = c("Less marginalized" = "steelblue",
+                                "More marginalized" = "tomato")) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Proportion of late presentations by year and marginalization group",
+       x = "Year of discharge",
+       y = "Proportion with late presentation (≥13 weeks)",
+       color = "Marginalization group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p2
+
+# Save plots as PNG
+ggsave("mean_gestational_duration_by_year.png", p1, width = 7, height = 5, dpi = 300)
+ggsave("prop_late_by_year.png", p2, width = 7, height = 5, dpi = 300)
+```
+
+## Final Checks
+
+```{r}
+# Make year numeric and set reference group for marg_group
+SAEH_full <- SAEH_full %>% 
+  mutate(year_num = as.numeric(year), 
+         marg_group = relevel(marg_group, ref = "Less marginalized"))
+
+# Mean gest by year (quantify flatness)
+SAEH_full %>%
+  filter(!is.na(gestat_clean)) %>%
+  group_by(year_num) %>%
+  summarise(mean_gest = mean(gestat_clean), n = n(), .groups = "drop") %>%
+  print(n = 7)
+
+# Verify ALL Calkini (04001) records have grade_marg in SAEH_full --------------
+cat("🔍 Calkini (04001) grade_marg verification:\n")
+SAEH_full %>%
+  filter(munic_id == "04001") %>%
+  summarise(
+    total_calkini_records = n(),
+    missing_grade_marg = sum(is.na(grade_marg)),
+    pct_complete = round(100 * mean(!is.na(grade_marg)), 1),
+    unique_grade_marg = paste(unique(grade_marg[!is.na(grade_marg)]), collapse = ", "))
+
+# Show sample of Calkini records
+SAEH_full %>%
+  filter(munic_id == "04001") %>%
+  select(year, clues, munic_id, grade_marg) %>%
+  print()
+
+
+# FORCE all Calkini (04001) records to have grade_marg = "Bajo" ----------------
+# Count NAs before fix
+n_na_before <- sum(SAEH_full$munic_id == "04001" & is.na(SAEH_full$grade_marg), na.rm = TRUE)
+cat("- Calkini NAs before:", n_na_before, "\n")
+
+# FORCE "Bajo" for ALL 04001 records
+SAEH_full <- SAEH_full %>%
+  mutate(
+    grade_marg = case_when(
+      munic_id == "04001" ~ "Bajo",  # Force Calkini to Bajo
+      TRUE ~ grade_marg))             # Keep others unchanged
+
+# Verify 100% complete
+cat("✓ After fix:\n")
+SAEH_full %>%
+  filter(munic_id == "04001") %>%
+  summarise(
+    total_calkini = n(),
+    calkini_nas = sum(is.na(grade_marg)),
+    all_bajo = sum(grade_marg == "Bajo", na.rm = TRUE),
+    pct_complete = paste0(round(100 * mean(!is.na(grade_marg)), 1), "%")) %>%
+  print()
+
+# Save data for Emily
+saveRDS(SAEH_full, "SAEH_1.rds")
+names(SAEH_full) <- gsub("\\.", "_", names(SAEH_full)) # save as .dta
+write_dta(SAEH_full, "SAEH_1.dta")
+
+# And a quick look at how mean gestational duration varies by marginalization group and year
+aggregate(gestat_clean ~ year + marg_group, data = SAEH_full, 
+          FUN = function(x) round(mean(x, na.rm = TRUE), 2))
+
+# Only complete cases - takes some observations due to missing gestational duration
+SAEH_complete <- SAEH_full[complete.cases(SAEH_full[, c("gest_age_cat", "marg_group", "year", "id")]), ]
+```
+
+**MODEL EQUATION:**
+
+$$\begin{aligned}
+\text{logit}(P(Y_{ij}=1)) = \; &\beta_0 + \beta_1 \cdot \text{marg\_group}_{ij} + \beta_2 \cdot \text{year\_c}_{ij} + \beta_3 \cdot \text{year\_c}_{ij}^2 \; + \\
+&\beta_4(\text{marg\_group}_{ij} \times \text{year\_c}_{ij}) + \beta_5(\text{marg\_group}_{ij} \times \text{year\_c}_{ij}^2) + u_j
+\end{aligned}$$
+
+**Where:**
+
+- $\text{logit}(P(Y_{ij}=1))$ = log-odds of late presentation ($\geq$ 13 weeks gestational duration) for record $i$ in municipality $j$
+- $\beta_0$ = baseline log-odds of late presentation for a Less marginalized municipality at the average year
+- $\beta_1 \cdot \text{marg\_group}_{ij}$ = difference in log-odds for More vs. Less marginalized municipalities at the average year
+- $\beta_2 \cdot \text{year\_c}_{ij}$ = linear component of the time trend for the Less marginalized reference group
+- $\beta_3 \cdot \text{year\_c}_{ij}^2$ = quadratic component of the time trend
+- $\beta_4(\text{marg\_group}_{ij} \times \text{year\_c}_{ij})$ = difference in the linear trajectory over time between marginalization groups
+- $\beta_5(\text{marg\_group}_{ij} \times \text{year\_c}_{ij}^2)$ = difference in the curvature of the time trend between marginalization groups
+- $u_j \sim \mathcal{N}(0, \sigma^2_u)$ = municipality-level random intercept
+
+*Binary outcome, two groups, time trend that's non-linear, quadratic term, interaction between group and time*
+
+## Prep for Model
+
+```{r}
+# Create centered year variable
+mean_year <- mean(SAEH_complete$year, na.rm = TRUE)
+mean_year  # year centers on ~ 2020 (2020.92)
+
+# Now a year squared
+SAEH_complete <- SAEH_complete %>%
+  mutate(year_c  = year - mean_year,
+         year_sq = year_c * year_c)
+
+# Verify
+SAEH_complete %>%
+  select(year, year_c, year_sq) %>%
+  distinct() %>%
+  arrange(year)
+```
+
+# Prepare analytic dataset
+
+```{r}
+# Create numeric binary outcome (GEE needs 0/1)
+SAEH_analytic <- SAEH_complete %>%
+  mutate(late_pres = as.integer(gest_age_cat == "Late")) %>% # 1 = Late, 0 = Early
+  arrange(munic_id, year)
+
+# Confirm outcome coding
+table(SAEH_analytic$late_pres, SAEH_analytic$gest_age_cat)
+
+# Confirm analytic sample
+nrow(SAEH_analytic)
+
+# Verify the exact year_c value for 2021
+knot_2021 <- SAEH_analytic %>%
+  filter(year == 2021) %>%
+  summarise(year_c_2021 = first(year_c)) %>%
+  pull(year_c_2021)
+
+# Build the spline term
+SAEH_analytic <- SAEH_analytic %>%
+  mutate(year_c_post = (year_c - knot_2021) * as.integer(year_c > knot_2021))
+
+# Verify
+SAEH_analytic %>%
+  select(year, year_c, year_c_post) %>%
+  distinct() %>%
+  arrange(year)
+```
+
+## Handle covariates
+
+```{r}
+SAEH_analytic <- SAEH_analytic %>%
+  mutate(
+    # Convert parity to factor with 0 as reference, keep Missing as category
+    parity_cat = factor(parity_cat, 
+                        levels = c("0", "1", "2", "3+", "Missing")),
+    
+    # Age reference = 20-24 (already ordered correctly, just confirm)
+    age_cat = relevel(as.factor(age_cat), ref = "20-24"),
+    
+    # Indigenous - keep No response as separate category
+    indigena_bin = relevel(as.factor(indigena_bin), ref = "No"),
+    
+    # Region - North already reference
+    region = relevel(as.factor(region), ref = "North"))
+
+# Verify
+levels(SAEH_analytic$parity_cat)
+levels(SAEH_analytic$age_cat)
+levels(SAEH_analytic$indigena_bin)
+levels(SAEH_analytic$region)
+```
+
+# Making gee model work!
+
+```{r}
+# Aggregate municipality marginalization group as a fixed attribute
+## Each municipality is measured 7 times (once per year)
+## Use the dominant/assigned marg_group for each municipality
+# SAEH_gee_agg <- SAEH_analytic %>%
+#   group_by(munic_id, year, year_c, year_sq, year_c_post) %>%
+#   summarise(n_total   = n(),
+#             n_late    = sum(late_pres),
+#             prop_late = mean(late_pres),
+#             marg_group = first(marg_group),  # municipality-level characteristic
+#             .groups   = "drop") %>%
+#   arrange(munic_id, year)
+
+# Check structure
+# nrow(SAEH_gee_agg)
+# head(SAEH_gee_agg)
+
+# Check rows per municipality
+# SAEH_gee_agg %>%
+#   count(munic_id) %>%
+#   count(n, name = "n_municipalities")
+```
+
+# Model
+
+```{r}
+# Logistic mixed effects model
+model_glmer <- glmer(late_pres ~ marg_group * year_c + marg_group * year_sq + 
+                       age_cat + parity_cat + indigena_bin + region + (1 | munic_id),
+                     data    = SAEH_analytic,
+                     family  = binomial(link = "logit"),
+                     nAGQ    = 30,
+                     control = glmerControl(optimizer = "bobyqa",
+                                            optCtrl   = list(maxfun = 2e5)))
+
+
+# GEE quadratic 
+# model_gee <- geeglm(prop_late ~ marg_group * year_c + marg_group * year_sq,
+#                     data    = SAEH_gee_agg,
+#                     family  = gaussian(link = "identity"),
+#                     weights = n_total,
+#                     control = geese.control(epsilon = 0.0001, maxit = 100),
+#                     id      = munic_id,
+#                     corstr  = "exchangeable",
+#                     std.err = "san.se")
+
+
+# GEE linear spline (knot at 2021)
+# model_spline <- geeglm(prop_late ~ marg_group * year_c + marg_group * year_c_post,
+#                        data    = SAEH_gee_agg,
+#                        family  = gaussian(link = "identity"),
+#                        weights = n_total,
+#                        control = geese.control(epsilon = 0.0001, maxit = 100),
+#                        id      = munic_id,
+#                        corstr  = "exchangeable",
+#                        std.err = "san.se")
+
+
+# Compare models
+summary(model_glmer)
+#summary(model_gee)
+#summary(model_spline)
+#QIC(model_gee)
+#QIC(model_spline)
+```
+
+# Choosing final model
+
+```{r}
+# Fit comparison models
+model_glmer_main <- glmer(late_pres ~ marg_group + year_c + year_sq + age_cat + 
+                            parity_cat + indigena_bin + region + (1 | munic_id),
+                          data    = SAEH_analytic,
+                          family  = binomial(link = "logit"),
+                          nAGQ    = 1,
+                          control = glmerControl(optimizer = "bobyqa",
+                                                 optCtrl   = list(maxfun = 2e5))) # main effects only (no interaction)
+
+model_glmer_linear <- glmer(late_pres ~ marg_group * year_c +age_cat + parity_cat + 
+                              indigena_bin + region + (1 | munic_id),
+                            data    = SAEH_analytic,
+                            family  = binomial(link = "logit"),
+                            nAGQ    = 1,
+                            control = glmerControl(optimizer = "bobyqa",
+                                                   optCtrl   = list(maxfun = 2e5))) # linear interaction only (no quadratic)
+
+# Compare
+AIC(model_glmer_main, model_glmer_linear, model_glmer)
+BIC(model_glmer_main, model_glmer_linear, model_glmer)
+anova(model_glmer_main, model_glmer)
+```
+
+**Final model:** Mixed-effects logistic regression ('model_glmer')
+
+Rationale: Data consists of individual hospital discharge records clustered within municipalities. No individual-level repeated measures structure exists. Municipality-level random intercept accounts for geographic clustering. GEE was not used as final model due to incompatibility between the data structure and GEE clustering requirements.
+
+```{r}
+# Odds ratios and 95% CIs for fixed effects
+est <- esticon(model_glmer, diag(22))
+est$Lower.CI <- est$estimate - 1.96 * est$std.error
+est$Upper.CI <- est$estimate + 1.96 * est$std.error
+
+OR.CI <- exp(cbind(est$estimate, est$Lower.CI, est$Upper.CI))
+rownames(OR.CI) <- names(fixef(model_glmer))
+colnames(OR.CI) <- c("OR", "Lower.OR", "Upper.OR")
+round(OR.CI, 3)
+
+# Also get the ICC to report
+var_munic <- as.numeric(VarCorr(model_glmer)$munic_id)
+icc <- var_munic / (var_munic + (pi^2 / 3))
+round(icc, 3)
+```
+
+```{r}
+# Extract coefficients
+b0        <- fixef(model_glmer)["(Intercept)"]
+b_marg    <- fixef(model_glmer)["marg_groupMore marginalized"]
+b_yearc   <- fixef(model_glmer)["year_c"]
+b_yearsq  <- fixef(model_glmer)["year_sq"]
+b_int_c   <- fixef(model_glmer)["marg_groupMore marginalized:year_c"]
+b_int_sq  <- fixef(model_glmer)["marg_groupMore marginalized:year_sq"]
+
+# Year range on centered scale
+year_range <- seq(min(SAEH_analytic$year_c), max(SAEH_analytic$year_c), by = 0.1)
+
+# Predicted log-odds for each group
+less_logits <- b0 + b_yearc * year_range + b_yearsq * year_range^2
+
+more_logits <- b0 + b_marg +
+               (b_yearc + b_int_c) * year_range +
+               (b_yearsq + b_int_sq) * year_range^2
+
+# Convert to probabilities
+less_probs <- exp(less_logits) / (1 + exp(less_logits))
+more_probs <- exp(more_logits) / (1 + exp(more_logits))
+
+# Back-transform year_c to actual year for x-axis
+actual_year <- year_range + mean_year
+
+# Build plot data
+plot_data <- data.frame(
+  year  = rep(actual_year, 2),
+  prob  = c(less_probs, more_probs),
+  group = rep(c("Less marginalized", "More marginalized"), 
+              each = length(actual_year)))
+
+# Plot the estimated prob
+ggplot(plot_data, aes(x = year, y = prob, color = group)) +
+  geom_line(linewidth = 1.5) +
+  scale_color_manual(values = c("Less marginalized" = "steelblue",
+                                "More marginalized" = "tomato")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_x_continuous(breaks = 2018:2024) +
+  labs(
+    title = "Estimated probability of late presentation by year and marginalization group",
+    x     = "Year of discharge",
+    y     = "Predicted probability of late presentation (≥13 weeks)",
+    color = "Marginalization group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "bottom")
+
+# Equivalent to margins command in Stata
+mean_year <- mean(SAEH_analytic$year_num, na.rm = TRUE) # mean year value used for centering
+
+# Convert target years to centered values
+year_c_vals <- 2018:2024 - mean_year
+
+emmeans(model_glmer, ~ marg_group * year_c,
+        at   = list(year_c = year_c_vals),
+        type = "response")
+```
+
+# Predicted prob table for presentation slides
+
+```{r}
+# Store emmeans output first
+emmeans_out <- emmeans(model_glmer, ~ marg_group * year_c, 
+                       at   = list(year_c = year_c_vals),
+                       type = "response")
+
+# Convert to dataframe and clean up
+emmeans_df <- as.data.frame(emmeans_out) %>%
+  mutate(year = round(year_c + mean_year))
+
+# Create formatted estimate (95% CI) column
+emmeans_df <- emmeans_df %>%
+  mutate(est_ci = paste0(
+    scales::percent(prob, accuracy = 0.1),
+    " (", scales::percent(asymp.LCL, accuracy = 0.1),
+    "–", scales::percent(asymp.UCL, accuracy = 0.1), ")"))
+
+# Pivot to wide format - one row per year
+emmeans_wide <- emmeans_df %>%
+  select(marg_group, year, est_ci, prob) %>%
+  pivot_wider(names_from  = marg_group,
+              values_from = c(est_ci, prob)) %>%
+  rename(less_ci   = `est_ci_Less marginalized`,
+         more_ci   = `est_ci_More marginalized`,
+         less_prob = `prob_Less marginalized`,
+         more_prob = `prob_More marginalized`)
+
+# Calculate gap in percentage points
+emmeans_wide <- emmeans_wide %>%
+  mutate(gap_pp = round(more_prob * 100, 1) - round(less_prob * 100, 1),
+         Gap    = paste0("+", gap_pp, "pp"))
+
+# Build gt table
+emmeans_wide %>%
+  select(year, less_ci, more_ci, Gap) %>%
+  gt() %>%
+  cols_label(
+    year    = "Year",
+    less_ci = "Less Marginalized",
+    more_ci = "More Marginalized",
+    Gap     = "Gap") %>%
+  tab_header(
+    title    = "Estimated Marginal Probabilities of Late Presentation",
+    subtitle = "By year and marginalization group (mixed-effects logistic regression, nAGQ = 30)") %>%
+  tab_spanner(
+    label   = "Predicted Probability (95% CI)",
+    columns = c(less_ci, more_ci)) %>%
+  tab_style(
+    style     = cell_fill(color = "#eef4fb"),
+    locations = cells_body(columns = less_ci)) %>%
+  tab_style(
+    style     = cell_fill(color = "#fef1ef"),
+    locations = cells_body(columns = more_ci)) %>%
+  tab_style(
+    style     = cell_text(color = "#c0392b", weight = "bold"),
+    locations = cells_body(columns = Gap)) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()) %>%
+  cols_align(align = "center", columns = c(less_ci, more_ci, Gap)) %>%
+  cols_align(align = "left", columns = year) %>%
+  gtsave("emmeans_table.png")
+```
+
+# Verify Model Fit
+
+```{r}
+# Compare all three models
+AIC(model_glmer_main, model_glmer_linear, model_glmer)
+BIC(model_glmer_main, model_glmer_linear, model_glmer)
+
+# Joint test of interactions via likelihood ratio test
+anova(model_glmer_main, model_glmer)
+```
+
+## Check random effects
+
+```{r}
+# Distribution of random effects - looks approximately normal
+ranef_vals <- ranef(model_glmer)$munic_id[,1]
+
+par(mfrow = c(1, 2))
+
+qqnorm(ranef_vals, 
+       main = "Q-Q plot of municipality random effects",
+       cex.main = 0.85)
+qqline(ranef_vals, col = "red")
+
+hist(ranef_vals, breaks = 30,
+     main = "Distribution of municipality random intercepts",
+     xlab = "Random intercept value",
+     col  = "steelblue",
+     border = "white",
+     cex.main = 0.85)
+
+par(mfrow = c(1, 1))
+```
+
+## Check for influential municipios
+
+```{r}
+# Are any municipalities driving results?
+ranef_df <- data.frame(munic_id = rownames(ranef(model_glmer)$munic_id),
+                       intercept = ranef(model_glmer)$munic_id[,1])
+
+# Flag potential outliers beyond 2 SDs
+sd_re <- sd(ranef_df$intercept)
+ranef_df %>%
+  filter(abs(intercept) > 2 * sd_re) %>%
+  arrange(desc(abs(intercept)))
+
+# How many records are in these outlier municipalities?
+outlier_munics <- ranef_df %>%
+  filter(abs(intercept) > 2 * sd_re) %>%
+  pull(munic_id)
+
+SAEH_analytic %>%
+  filter(munic_id %in% outlier_munics) %>%
+  group_by(munic_id) %>%
+  summarise(
+    n = n(),
+    prop_late = round(mean(late_pres), 3),
+    marg_group = first(marg_group)) %>%
+  arrange(desc(abs(prop_late - mean(SAEH_analytic$late_pres))))
+```
+
+# Layered plot
+
+```{r}
+# Recalculate observed proportions
+observed_data <- SAEH_analytic %>%
+  filter(!is.na(late_pres) & !is.na(marg_group)) %>%
+  group_by(year, marg_group) %>%
+  summarise(prop_late = mean(late_pres), .groups = "drop")
+
+# Calculate observed means by group
+obs_mean_less <- SAEH_analytic %>% 
+  filter(marg_group == "Less marginalized") %>% 
+  pull(late_pres) %>% mean(na.rm = TRUE)
+
+obs_mean_more <- SAEH_analytic %>% 
+  filter(marg_group == "More marginalized") %>% 
+  pull(late_pres) %>% mean(na.rm = TRUE)
+
+# Group-specific offsets
+offset_less <- qlogis(obs_mean_less) - b0
+offset_more <- qlogis(obs_mean_more) - (b0 + b_marg)
+
+# Apply group-specific offsets
+less_logits <- (b0 + offset_less) + b_yearc * year_range + b_yearsq * year_range^2
+more_logits <- (b0 + offset_more + b_marg) +
+               (b_yearc + b_int_c) * year_range +
+               (b_yearsq + b_int_sq) * year_range^2
+
+less_probs <- plogis(less_logits)
+more_probs <- plogis(more_logits)
+
+pred_data <- data.frame(
+  year       = rep(actual_year, 2),
+  prop_late  = c(less_probs, more_probs),
+  marg_group = rep(c("Less marginalized", "More marginalized"),
+                   each = length(actual_year)), 
+  type = "Predicted")
+
+# Plot
+p3 <- ggplot() +
+  geom_point(data = observed_data,
+             aes(x = year, y = prop_late, color = marg_group),
+             size = 2, shape = 16) +
+  geom_line(data = observed_data,
+            aes(x = year, y = prop_late, color = marg_group),
+            linetype = "dashed", linewidth = 0.8) +
+  geom_line(data = pred_data,
+            aes(x = year, y = prop_late, color = marg_group),
+            linewidth = 0.75) +
+  scale_color_manual(values = c("Less marginalized" = "steelblue",
+                                "More marginalized" = "tomato")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0.10, 0.30)) +
+  scale_x_continuous(breaks = 2018:2024) +
+  annotate("text", x = 2023.6, y = 0.120, label = "— Predicted",   size = 3.8, color = "black") +
+  annotate("text", x = 2023.6, y = 0.105, label = "- - - Observed", size = 4,   color = "black") +
+  labs(title = "Predicted vs. Observed Probability of Late Presentation by Year and Marginalization Group",
+       x     = "Year of discharge",
+       y     = "Probability of late presentation (≥13 weeks)",
+       color = "Marginalization group") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 11), 
+        legend.position = "bottom")
+
+p3
+ggsave("layer_plot.png", p3, width = 9, height = 5, dpi = 300)
+```
+
+# Sensitivity Anaylsis with ordinal marginalization (quintiles):
+
+```{r}
+# Recode as ordered quintile factor
+SAEH_analytic <- SAEH_analytic %>%
+  mutate(grade_marg = factor(grade_marg,
+                                  levels = c("Muy bajo", "Bajo", "Medio", "Alto", "Muy alto"),
+                                  ordered = TRUE))
+
+# Fit simple sensitivity model with ordinal marginalization
+model_glmer_ord <- glmer(late_pres ~ grade_marg + year_c + year_sq + age_cat + 
+                           parity_cat + indigena_bin + region + (1 | munic_id),
+                         data    = SAEH_analytic,
+                         family  = binomial(link = "logit"),
+                         nAGQ    = 1,
+                         control = glmerControl(optimizer = "bobyqa", 
+                                                optCtrl  = list(maxfun = 2e5)))
+
+summary(model_glmer_ord)
+
+# Get predicted probabilities for each quintile
+year_c_vals <- 2018:2024 - mean_year
+
+# Get emmeans output
+emmeans_ord <- emmeans(model_glmer_ord, ~ grade_marg * year_c,
+                       at       = list(year_c = year_c_vals),
+                       nuisance = c("age_cat", "parity_cat", "indigena_bin", "region"),
+                       type     = "response")
+
+# Convert to dataframe
+emmeans_ord_df <- as.data.frame(emmeans_ord) %>%
+  mutate(
+    year   = round(year_c + mean_year),
+    est_ci = paste0(
+      scales::percent(prob, accuracy = 0.1),
+      " (", scales::percent(asymp.LCL, accuracy = 0.1),
+      "–", scales::percent(asymp.UCL, accuracy = 0.1), ")"),
+    grade_marg = factor(grade_marg,
+                        levels = c("Muy bajo", "Bajo", "Medio", "Alto", "Muy alto")))
+
+# Pivot to wide - one row per year, one column per quintile
+emmeans_ord_wide <- emmeans_ord_df %>%
+  select(grade_marg, year, est_ci) %>%
+  pivot_wider(names_from  = grade_marg,
+              values_from = est_ci)
+
+# Build gt table
+emmeans_ord_wide %>%
+  gt() %>%
+  cols_label(
+    year      = "Year",
+    `Muy bajo` = "Muy Bajo\n(Q1)",
+    `Bajo`     = "Bajo\n(Q2)",
+    `Medio`    = "Medio\n(Q3)",
+    `Alto`     = "Alto\n(Q4)",
+    `Muy alto` = "Muy Alto\n(Q5)") %>%
+  tab_header(
+    title    = "Supplemental Table 2. Estimated Marginal Probabilities of Late Presentation by Marginalization Quintile and Year",
+    subtitle = "Ordinal marginalization sensitivity analysis (mixed-effects logistic regression, nAGQ = 1)") %>%
+  tab_source_note(
+    "Values presented as predicted probability (95% CI), averaged over age, parity, indigenous identity, and region.
+     Q1 = least marginalized (Muy bajo); Q5 = most marginalized (Muy alto).
+     Linear contrast β_L = 0.226, p < 0.001; no significant higher-order terms.") %>%
+  tab_spanner(
+    label   = "Marginalization Quintile — Predicted Probability (95% CI)",
+    columns = c(`Muy bajo`, `Bajo`, `Medio`, `Alto`, `Muy alto`)) %>%
+  tab_style(
+    style     = cell_fill(color = "#eef4fb"),
+    locations = cells_body(columns = c(`Muy bajo`, `Bajo`))) %>%
+  tab_style(
+    style     = cell_fill(color = "#fef1ef"),
+    locations = cells_body(columns = c(`Alto`, `Muy alto`))) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()) %>%
+  cols_align(align = "center", 
+             columns = c(`Muy bajo`, `Bajo`, `Medio`, `Alto`, `Muy alto`)) %>%
+  cols_align(align = "left", columns = year) %>%
+  gtsave("supplemental_table2_ordinal.png")
+```
+
+**every step up the marginalization scale corresponds to a higher probability of late presentation**
+
+# Sensitivity Analysis for missing data (treat missing as a category):
+
+```{r}
+# Create missingness indicator in FULL pre-filtered dataset
+SAEH_missing <- SAEH_full %>% 
+  mutate(ga_missing = is.na(gestat),  # TRUE if gestational duration is missing
+         late_pres = as.integer(gest_age_cat == "Late")) %>% # 1 = Late, 0 = Early
+  arrange(munic_id, year)
+
+SAEH_missing <- SAEH_missing %>% 
+  mutate(late_pres_sens = case_when(late_pres == 1 ~ 1,
+                                    late_pres == 0 ~ 0,
+                                    is.na(gestat) ~ 2))  # missing as its own category
+
+# Check if missingness is associated with marginalization
+table(SAEH_missing$marg_group, SAEH_missing$ga_missing) %>% 
+  prop.table(margin = 1) %>% 
+  round(3)
+
+# Chi-square test
+chisq.test(SAEH_missing$marg_group, SAEH_missing$ga_missing)
+
+# Check if missingness varies by year and marginalization
+SAEH_missing %>%
+  group_by(year, marg_group) %>%
+  summarise(n_total   = n(),
+            n_missing = sum(ga_missing),
+            pct_missing = mean(ga_missing) * 100,
+            .groups = "drop") %>%
+  print(n = 50)
+
+# Visualize missingness pattern
+ggplot(SAEH_missing %>% 
+         group_by(year, marg_group) %>%
+         summarise(pct_missing = mean(ga_missing) * 100, .groups = "drop"),
+       aes(x = year, y = pct_missing, color = marg_group, group = marg_group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Less marginalized" = "steelblue",
+                                "More marginalized" = "tomato")) +
+  scale_x_continuous(breaks = 2018:2024) +
+  labs(title = "Percentage of missing gestational duration by year and marginalization group",
+       x     = "Year",
+       y     = "% missing gestational duration",
+       color = "Marginalization group") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+# Create centered year variable
+mean_year <- mean(SAEH_missing$year, na.rm = TRUE)
+
+# Now a year squared
+SAEH_missing <- SAEH_missing %>%
+  mutate(year_c  = year - mean_year,
+         year_sq = year_c * year_c)
+
+# Verify
+SAEH_missing %>%
+  select(year, year_c, year_sq) %>%
+  distinct() %>%
+  arrange(year)
+
+# Logistic regression — does marginalization predict missingness?
+model_missing <- glmer(ga_missing ~ marg_group * year_c + marg_group * year_sq + (1 | munic_id),
+                       data    = SAEH_missing,
+                       family  = binomial(link = "logit"),
+                       nAGQ    = 1,
+                       control = glmerControl(optimizer = "bobyqa",
+                                              optCtrl  = list(maxfun = 2e5)))
+
+summary(model_missing)
+```
+
+# Random slopes
+
+```{r}
+# Random intercept + random slope for linear time
+model_glmer_rs <- glmer(
+  late_pres ~ marg_group * year_c + marg_group * year_sq +
+    age_cat + parity_cat + indigena_bin + region +
+    (1 + year_c | munic_id),  # random slope for linear time
+  data    = SAEH_analytic,
+  family  = binomial(link = "logit"),
+  nAGQ    = 1,  # start with 1 for speed
+  control = glmerControl(optimizer = "bobyqa",
+                         optCtrl  = list(maxfun = 2e5)))
+
+# Compare to random intercept only model
+anova(model_glmer, model_glmer_rs)
+AIC(model_glmer, model_glmer_rs)
+BIC(model_glmer, model_glmer_rs)
+```
+
+```{r}
+# Random intercept + random slope using GLMMadaptive (correct approach)
+model_rs <- mixed_model(
+  fixed  = late_pres ~ marg_group * year_c + marg_group * year_sq +
+             age_cat + parity_cat + indigena_bin + region,
+  random = ~ year_c | munic_id,   # random slope for linear time
+  data   = SAEH_analytic,
+  family = binomial,
+  nAGQ   = 20)   # start with 20, update to 40 if it converges
+
+summary(model_rs)
+
+# Update to 40 quadrature points for better accuracy
+# model_rs40 <- update(model_rs, nAGQ = 40)
+# summary(model_rs40)
+
+# Note: anova() comparison between glmer and mixed_model objects
+# won't work directly — compare AIC/BIC manually
+AIC(model_glmer)   # your primary model
+AIC(model_rs)    # random slopes model
+
+BIC(model_glmer)
+BIC(model_rs)
+```
