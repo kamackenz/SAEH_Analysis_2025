@@ -1,0 +1,17 @@
+.Rhistory
+.RData
+.RDataTmp*
+.Rapp.history
+.Rproj.user/
+.DS_Store
+~$*
+*.zip
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+*.dta
+*.rds
+*.png
+*.mp4
+*.m4a
